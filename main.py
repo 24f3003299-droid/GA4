@@ -200,100 +200,40 @@ async def root():
 @app.post("/grounded-answer")
 async def q3_answer(request: Request):
     body = await request.json()
-
-    question = body.get("question", "").strip()
+    question = body.get("question", "")
     chunks = body.get("chunks", [])
-
-    if not question or not chunks:
-        return {
-            "answer": "I don't know",
-            "citations": [],
-            "confidence": 0.1,
-            "answerable": False
-        }
-
-    valid_ids = {c["chunk_id"] for c in chunks if "chunk_id" in c}
-
-    prompt = f"""
-You are a grounded QA system.
-
-Use ONLY the supplied chunks.
-
-If the answer is not completely supported by the chunks,
-return exactly:
-
-{{
-"answer":"I don't know",
-"citations":[],
-"confidence":0.1,
-"answerable":false
-}}
-
-Otherwise return JSON:
-
-{{
-"answer":"...",
-"citations":["C1"],
-"confidence":0.95,
-"answerable":true
-}}
-
-Question:
-{question}
-
-Chunks:
-{json.dumps(chunks, ensure_ascii=False)}
-"""
-
+    prompt = (
+        "You are a highly reliable Grounded QA API for medical and legal compliance.\n"
+        "Your task is to answer the user's question strictly using ONLY the provided context chunks.\n"
+        "1. If the question CANNOT be answered from the chunks, you MUST return:\n"
+        "   - answerable: false\n"
+        "   - answer: \"I don't know\" (exact match)\n"
+        "   - citations: [] (empty array)\n"
+        "   - confidence: 0.1\n"
+        "2. If it CAN be answered, return:\n"
+        "   - answerable: true\n"
+        "   - answer: <your grounded answer>\n"
+        "   - citations: [<list of ONLY the chunk_ids you used>]\n"
+        "   - confidence: <float between 0.8 and 1.0>\n"
+        "NEVER use outside knowledge. Return strictly JSON with exactly these 4 keys.\n\n"
+        f"QUESTION:\n{question}\n\n"
+        f"CHUNKS:\n{json.dumps(chunks, indent=2)}"
+    )
     try:
-        raw = await chat(
-            [{"role":"user","content":prompt}],
-            model="gpt-4o-mini",
-            max_tokens=500
-        )
-
-        out = parse_json(raw)
-
-        answerable = bool(out.get("answerable", False))
-        answer = str(out.get("answer","")).strip()
-
-        citations = [
-            c for c in out.get("citations", [])
-            if c in valid_ids
-        ]
-
-        confidence = float(out.get("confidence", 0.1))
-
-        # ---------- Guardrails ----------
-        if (
-            not answerable
-            or answer.lower() == "i don't know"
-            or len(citations) == 0
-        ):
-            return {
-                "answer":"I don't know",
-                "citations":[],
-                "confidence":0.1,
-                "answerable":False
-            }
-
-        confidence = max(0.31, min(confidence, 1.0))
-
+        out = parse_json(await chat([{"role": "user", "content": prompt}], model="gpt-4o-mini", max_tokens=1000))
+        if not out.get("answerable", False) or out.get("confidence", 1.0) <= 0.3:
+            return {"answer": "I don't know", "citations": [], "confidence": 0.1, "answerable": False}
+        valid_ids = [c["chunk_id"] for c in chunks]
+        cites = [c for c in out.get("citations", []) if c in valid_ids]
         return {
-            "answer":answer,
-            "citations":citations,
-            "confidence":confidence,
-            "answerable":True
+            "answer": out.get("answer", "I don't know"),
+            "citations": cites,
+            "confidence": float(out.get("confidence", 0.9)),
+            "answerable": True
         }
-
     except Exception:
-        return {
-            "answer":"I don't know",
-            "citations":[],
-            "confidence":0.1,
-            "answerable":False
-        }
-            
+        return {"answer": "I don't know", "citations": [], "confidence": 0.1, "answerable": False}
+
 # ================= Q4: /vector-search =================
 def cosine_sim(a, b):
     norm_a = np.linalg.norm(a)
