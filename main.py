@@ -196,7 +196,15 @@ def parse_json(s):
 async def root():
     return {"ok": True, "email": config.EMAIL}
 
-# ================= Q3: /q3/answer =================
+# ================= Q3: /q3/answer 
+print("REQUEST:", body)
+...
+print("RESPONSE:", {
+    "answer": out.get("answer"),
+    "citations": out.get("citations"),
+    "confidence": out.get("confidence"),
+    "answerable": out.get("answerable")
+})
 @app.post("/grounded-answer")
 async def q3_answer(request: Request):
     body = await request.json()
@@ -233,6 +241,14 @@ async def q3_answer(request: Request):
         }
     except Exception:
         return {"answer": "I don't know", "citations": [], "confidence": 0.1, "answerable": False}
+print("REQUEST:", body)
+...
+print("RESPONSE:", {
+    "answer": out.get("answer"),
+    "citations": out.get("citations"),
+    "confidence": out.get("confidence"),
+    "answerable": out.get("answerable")
+})
 
 # ================= Q4: /vector-search =================
 def cosine_sim(a, b):
