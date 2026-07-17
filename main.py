@@ -1,4 +1,4 @@
-import json, re, hashlib, os, math, struct
+import json, re, hashlib, os, math, struct, sys
 from contextlib import asynccontextmanager
 from fastapi import FastAPI, Request
 from fastapi.middleware.cors import CORSMiddleware
@@ -170,13 +170,21 @@ async def chat(messages, model=None, max_tokens=800, force_json=True, retries=4)
     last_err = None
     async with httpx.AsyncClient(timeout=90) as c:
         for attempt in range(retries):
-            r = await c.post(f"{config.AIPIPE_BASE}/chat/completions",
-                             headers=HEAD, json=body)
+            try:
+                r = await c.post(f"{config.AIPIPE_BASE}/chat/completions",
+                                 headers=HEAD, json=body)
+            except httpx.HTTPError as e:
+                last_err = f"transport error: {e}"
+                await asyncio.sleep(1.5 * (attempt + 1))
+                continue
             if r.status_code in (429, 500, 502, 503, 504):
                 last_err = f"HTTP {r.status_code}: {r.text[:160]}"
                 await asyncio.sleep(1.5 * (attempt + 1))
                 continue
-            r.raise_for_status()
+            if r.status_code >= 400:
+                # Non-retryable client error (e.g. bad model name, bad param).
+                # Surface it instead of silently retrying forever.
+                raise RuntimeError(f"chat failed: HTTP {r.status_code}: {r.text[:300]}")
             out = r.json()["choices"][0]["message"]["content"]
             _CACHE[key] = out
             return out
@@ -196,44 +204,130 @@ def parse_json(s):
 async def root():
     return {"ok": True, "email": config.EMAIL}
 
-# ================= Q3: /q3/answer 
+# ================= Q3: /grounded-answer =================
+
+UNANSWERABLE_RESPONSE = {
+    "answer": "I don't know",
+    "citations": [],
+    "confidence": 0.1,
+    "answerable": False,
+}
+
+GROUNDED_QA_SYSTEM_PROMPT = """You are a highly reliable Grounded QA API for medical and legal compliance.
+
+Answer the user's question using ONLY the facts explicitly stated in the provided context chunks.
+
+STRICT GROUNDING RULES:
+- Do NOT use any outside knowledge, training data, or general world knowledge — even if you
+  "know" the real-world answer. Only what is written in the chunks counts as truth.
+- Do NOT infer, guess, extrapolate, or combine unrelated facts to produce an answer that is
+  not explicitly and directly supported by the text of one or more chunks.
+- A chunk merely mentioning the same topic/entity as the question is NOT sufficient — the
+  chunk must actually state the specific fact being asked for.
+- If the chunks contradict each other, or only partially answer the question, or the answer
+  requires assuming something not written, treat the question as UNANSWERABLE.
+
+DECISION PROCEDURE (follow in order):
+1. Identify exactly which chunk(s), if any, contain the specific fact needed to answer.
+2. If no chunk contains that specific fact -> UNANSWERABLE.
+3. If at least one chunk directly and explicitly contains it -> ANSWERABLE, and cite only
+   those chunk_ids.
+
+OUTPUT — return ONLY a JSON object with exactly these 4 keys, nothing else:
+- If UNANSWERABLE:
+  {"answerable": false, "answer": "I don't know", "citations": [], "confidence": 0.1}
+- If ANSWERABLE:
+  {"answerable": true, "answer": "<concise grounded answer>", "citations": ["<chunk_id>", ...], "confidence": <float between 0.8 and 1.0>}
+
+EXAMPLES:
+
+Chunks:
+[{"chunk_id":"C1","text":"FAISS was developed by Facebook AI Research and open-sourced in 2017."}]
+Question: "What year was FAISS released?"
+Answer: {"answerable": true, "answer": "FAISS was open-sourced in 2017.", "citations": ["C1"], "confidence": 0.95}
+
+Chunks:
+[{"chunk_id":"C2","text":"Qdrant is a vector database written in Rust, released in 2021."},
+ {"chunk_id":"C3","text":"ChromaDB is an open-source embedding database."}]
+Question: "What year was FAISS released?"
+Answer: {"answerable": false, "answer": "I don't know", "citations": [], "confidence": 0.1}
+(Reasoning: neither chunk mentions FAISS at all, even though both are about vector databases.)
+
+Chunks:
+[{"chunk_id":"C4","text":"ChromaDB is an open-source embedding database."}]
+Question: "Is ChromaDB open-source?"
+Answer: {"answerable": true, "answer": "Yes, ChromaDB is an open-source embedding database.", "citations": ["C4"], "confidence": 0.95}
+"""
 
 @app.post("/grounded-answer")
 async def q3_answer(request: Request):
-    body = await request.json()
-    question = body.get("question", "")
-    chunks = body.get("chunks", [])
-    prompt = (
-        "You are a highly reliable Grounded QA API for medical and legal compliance.\n"
-        "Your task is to answer the user's question strictly using ONLY the provided context chunks.\n"
-        "1. If the question CANNOT be answered from the chunks, you MUST return:\n"
-        "   - answerable: false\n"
-        "   - answer: \"I don't know\" (exact match)\n"
-        "   - citations: [] (empty array)\n"
-        "   - confidence: 0.1\n"
-        "2. If it CAN be answered, return:\n"
-        "   - answerable: true\n"
-        "   - answer: <your grounded answer>\n"
-        "   - citations: [<list of ONLY the chunk_ids you used>]\n"
-        "   - confidence: <float between 0.8 and 1.0>\n"
-        "NEVER use outside knowledge. Return strictly JSON with exactly these 4 keys.\n\n"
-        f"QUESTION:\n{question}\n\n"
-        f"CHUNKS:\n{json.dumps(chunks, indent=2)}"
-    )
     try:
-        out = parse_json(await chat([{"role": "user", "content": prompt}], model="gpt-4o-mini", max_tokens=1000))
-        if not out.get("answerable", False) or out.get("confidence", 1.0) <= 0.3:
-            return {"answer": "I don't know", "citations": [], "confidence": 0.1, "answerable": False}
-        valid_ids = [c["chunk_id"] for c in chunks]
-        cites = [c for c in out.get("citations", []) if c in valid_ids]
-        return {
-            "answer": out.get("answer", "I don't know"),
-            "citations": cites,
-            "confidence": float(out.get("confidence", 0.9)),
-            "answerable": True
-        }
+        body = await request.json()
     except Exception:
-        return {"answer": "I don't know", "citations": [], "confidence": 0.1, "answerable": False}
+        return UNANSWERABLE_RESPONSE
+
+    question = (body.get("question") or "").strip()
+    chunks = body.get("chunks")
+    if not isinstance(chunks, list):
+        chunks = []
+
+    # Normalize chunks defensively; drop anything malformed.
+    clean_chunks = []
+    for c in chunks:
+        if isinstance(c, dict) and "chunk_id" in c and "text" in c:
+            clean_chunks.append({"chunk_id": str(c["chunk_id"]), "text": str(c["text"])})
+
+    # Rule 4: handle empty/malformed input gracefully without ever calling the LLM.
+    if not question or not clean_chunks:
+        return UNANSWERABLE_RESPONSE
+
+    valid_ids = {c["chunk_id"] for c in clean_chunks}
+
+    user_prompt = (
+        f"QUESTION:\n{question}\n\n"
+        f"CHUNKS:\n{json.dumps(clean_chunks, indent=2)}"
+    )
+
+    try:
+        raw = await chat(
+            [
+                {"role": "system", "content": GROUNDED_QA_SYSTEM_PROMPT},
+                {"role": "user", "content": user_prompt},
+            ],
+            model="gpt-4o-mini",
+            max_tokens=1000,
+        )
+        out = parse_json(raw)
+    except Exception as e:
+        print(f"[grounded-answer] LLM call/parse failed: {e}", file=sys.stderr)
+        return UNANSWERABLE_RESPONSE
+
+    answerable = bool(out.get("answerable", False))
+    confidence = out.get("confidence", 0.1 if not answerable else 0.9)
+    try:
+        confidence = float(confidence)
+    except (TypeError, ValueError):
+        confidence = 0.1 if not answerable else 0.9
+
+    if not answerable or confidence <= 0.3:
+        return UNANSWERABLE_RESPONSE
+
+    cites = [c for c in out.get("citations", []) if c in valid_ids]
+    # If the model claimed "answerable" but cited nothing that actually exists,
+    # it has no real grounding — treat as unanswerable rather than trust it.
+    if not cites:
+        return UNANSWERABLE_RESPONSE
+
+    answer_text = str(out.get("answer") or "").strip()
+    if not answer_text:
+        return UNANSWERABLE_RESPONSE
+
+    return {
+        "answer": answer_text,
+        "citations": cites,
+        "confidence": max(0.8, min(1.0, confidence)),
+        "answerable": True,
+    }
 
 
 # ================= Q4: /vector-search =================
@@ -307,7 +401,8 @@ async def extract_graph(request: Request):
     try:
         out = parse_json(await chat([{"role": "user", "content": prompt}], model="gpt-4o", max_tokens=1500))
         return {"entities": out.get("entities", []), "relationships": out.get("relationships", [])}
-    except Exception:
+    except Exception as e:
+        print(f"[extract-graph] failed: {e}", file=sys.stderr)
         return {"entities": [], "relationships": []}
 
 @app.post("/graph-query")
@@ -332,7 +427,8 @@ async def graph_query(request: Request):
         out = parse_json(await chat([{"role": "user", "content": prompt}], model="gpt-4o", max_tokens=1500))
         path = out.get("reasoning_path", [])
         return {"answer": out.get("answer", ""), "reasoning_path": path, "hops": len(path) - 1 if path else 0}
-    except Exception:
+    except Exception as e:
+        print(f"[graph-query] failed: {e}", file=sys.stderr)
         return {"answer": "", "reasoning_path": [], "hops": 0}
 
 @app.post("/community-summary")
@@ -355,5 +451,6 @@ async def community_summary(request: Request):
     try:
         out = parse_json(await chat([{"role": "user", "content": prompt}], model="gpt-4o", max_tokens=1500))
         return {"community_id": community_id, "summary": out.get("summary", "")}
-    except Exception:
+    except Exception as e:
+        print(f"[community-summary] failed: {e}", file=sys.stderr)
         return {"community_id": community_id, "summary": ""}
